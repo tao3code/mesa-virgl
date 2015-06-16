@@ -11,6 +11,7 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <xf86drm.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include "virtgpu_drm.h"
 
@@ -338,29 +339,43 @@ static struct virgl_hw_res *virgl_drm_winsys_resource_create_handle(struct virgl
    struct drm_virtgpu_resource_info info_arg = {};
    struct virgl_hw_res *res;
 
-   memset(&open_arg, 0, sizeof(open_arg));
-
    pipe_mutex_lock(qdws->bo_handles_mutex);
 
-   res = util_hash_table_get(qdws->bo_handles, (void*)(uintptr_t)whandle->handle);
-   if (res) {
-      struct virgl_hw_res *r = NULL;
-      virgl_drm_resource_reference(qdws, &r, res);
-      goto done;
+   if (whandle->type == DRM_API_HANDLE_TYPE_SHARED) {
+      res = util_hash_table_get(qdws->bo_handles, (void*)(uintptr_t)whandle->handle);
+      if (res) {
+         struct virgl_hw_res *r = NULL;
+         virgl_drm_resource_reference(qdws, &r, res);
+         goto done;
+      }
    }
 
    res = CALLOC_STRUCT(virgl_hw_res);
    if (!res)
       goto done;
 
-   open_arg.name = whandle->handle;
-   if (drmIoctl(qdws->fd, DRM_IOCTL_GEM_OPEN, &open_arg)) {
-        FREE(res);
-        res = NULL;
-        goto done;
+   if (whandle->type == DRM_API_HANDLE_TYPE_FD) {
+      int r;
+      uint32_t handle;
+      r = drmPrimeFDToHandle(qdws->fd, whandle->handle, &handle);
+      if (r) {
+         FREE(res);
+         res = NULL;
+         goto done;
+      }
+      res->bo_handle = handle;
+   } else {
+      memset(&open_arg, 0, sizeof(open_arg));
+      open_arg.name = whandle->handle;
+      if (drmIoctl(qdws->fd, DRM_IOCTL_GEM_OPEN, &open_arg)) {
+         FREE(res);
+         res = NULL;
+         goto done;
+      }
+      res->bo_handle = open_arg.handle;
    }
-   res->bo_handle = open_arg.handle;
    res->name = whandle->handle;
+
    memset(&info_arg, 0, sizeof(info_arg));
    info_arg.bo_handle = res->bo_handle;
 
@@ -393,6 +408,8 @@ static boolean virgl_drm_winsys_resource_get_handle(struct virgl_winsys *qws,
    struct virgl_drm_winsys *qdws = virgl_drm_winsys(qws);
    struct drm_gem_flink flink;
 
+   if (!res)
+       return FALSE;
    memset(&flink, 0, sizeof(flink));
 
    if (whandle->type == DRM_API_HANDLE_TYPE_SHARED) {
@@ -412,6 +429,9 @@ static boolean virgl_drm_winsys_resource_get_handle(struct virgl_winsys *qws,
       whandle->handle = res->flink;
    } else if (whandle->type == DRM_API_HANDLE_TYPE_KMS) {
       whandle->handle = res->bo_handle;
+   } else if (whandle->type == DRM_API_HANDLE_TYPE_FD) {
+      if (drmPrimeHandleToFD(qdws->fd, res->bo_handle, DRM_CLOEXEC, (int*)&whandle->handle))
+            return FALSE;
    }
    whandle->stride = stride;
    return TRUE;
